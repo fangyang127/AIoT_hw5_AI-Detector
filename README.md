@@ -2,6 +2,8 @@
 
 使用 Hugging Face 模型（`roberta-base-openai-detector`）在本地快速判定文本為 **AI 生成** 或 **人類撰寫** 的機率。介面採用 Streamlit，支援文字輸入與檔案上傳。
 
+Demo site：<https://aiot-hw5-ai-detector-7114056047.streamlit.app/>
+
 ## 功能
 - 文字輸入框與 `.txt` 檔案上傳
 - 即時顯示 AI% / Human%（進度條與文字結論）
@@ -37,4 +39,3 @@ streamlit run app.py
 - 加入傳統特徵（困惑度、常見詞頻等）與 transformer 混合投票，提升魯棒性。
 - 蒐集中英文真實/生成語料微調模型，以適配特定領域。
 - 增加批次檔案處理與結果匯出（CSV）。
-
