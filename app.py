@@ -41,7 +41,7 @@ def _heuristic_ai_boost(text: str) -> float:
         r"\bglad to help\b",
     ]
     text_lower = text.lower()
-    return 0.4 if any(re.search(p, text_lower) for p in patterns) else 0.0
+    return 0.6 if any(re.search(p, text_lower) for p in patterns) else 0.0
 
 
 def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]:
@@ -104,8 +104,11 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
     ai_prob = ai_prob / weight_sum
     human_prob = human_prob / weight_sum
 
-    # 針對明顯 LLM 片語做微幅加權
-    ai_prob = min(1.0, ai_prob + _heuristic_ai_boost(text))
+    # 針對明顯 LLM 片語做加權與下限提升（強制偏向 AI）
+    heuristic = _heuristic_ai_boost(text)
+    if heuristic > 0:
+        ai_prob = 0.95
+        human_prob = 0.05
 
     # 正規化讓 AI% + Human% = 1
     total = ai_prob + human_prob
