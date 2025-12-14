@@ -106,7 +106,14 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
 
     # 針對明顯 LLM 片語做微幅加權
     ai_prob = min(1.0, ai_prob + _heuristic_ai_boost(text))
-    human_prob = max(0.0, 1.0 - ai_prob) if ai_prob + human_prob == 0 else human_prob
+
+    # 正規化讓 AI% + Human% = 1
+    total = ai_prob + human_prob
+    if total > 0:
+        ai_prob = ai_prob / total
+        human_prob = human_prob / total
+    else:
+        human_prob = 1.0 - ai_prob
 
     max_confidence = max(ai_prob, human_prob)
     return ai_prob, human_prob, max_confidence, breakdown
