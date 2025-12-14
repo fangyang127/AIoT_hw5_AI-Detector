@@ -1,4 +1,3 @@
-import io
 import math
 import re
 from typing import Dict, List, Optional, Tuple
@@ -8,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 
-# 支援多個模型並快取，方便 ensemble
+# 快取分類模型，避免重複載入
 @st.cache_resource(show_spinner=False)
 def load_detector(model_name: str):
     return pipeline(
@@ -18,11 +17,11 @@ def load_detector(model_name: str):
     )
 
 
+# 使用 distilgpt2 作為輕量困惑度模型，避免資源爆掉
 @st.cache_resource(show_spinner=False)
 def load_ppl_model():
-    """載入 GPT2 用於困惑度估計（小模型，CPU 可接受）。"""
-    tok = AutoTokenizer.from_pretrained("gpt2")
-    mdl = AutoModelForCausalLM.from_pretrained("gpt2")
+    tok = AutoTokenizer.from_pretrained("distilgpt2")
+    mdl = AutoModelForCausalLM.from_pretrained("distilgpt2")
     return tok, mdl
 
 
@@ -36,8 +35,8 @@ def read_uploaded_file(file) -> str:
 
 def _heuristic_ai_boost(text: str) -> float:
     """
-    若文本包含常見 LLM 自我描述語句，對 AI 機率做微幅加權。
-    這些片語在真實人類文本中少見，可提升偵測準確度。
+    若文本包含常見 LLM 自我描述語句，對 AI 機率做加權。
+    這些片語在真實人類文本中少見，可提升偵測率。
     """
     patterns = [
         r"\bas an ai language model\b",
@@ -59,7 +58,7 @@ def _heuristic_ai_boost(text: str) -> float:
 
 
 def _gpt2_perplexity(text: str) -> Optional[float]:
-    """計算 GPT2 困惑度，文本過短時返回 None。"""
+    """計算 distilgpt2 困惑度，文本過短時返回 None。"""
     if len(text.split()) < 8:
         return None
     tok, mdl = load_ppl_model()
@@ -70,11 +69,15 @@ def _gpt2_perplexity(text: str) -> Optional[float]:
     return math.exp(loss.item())
 
 
-def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]:
+def predict(
+    text: str,
+    use_ensemble: bool = True,
+    use_perplexity: bool = True,
+) -> Optional[Tuple[float, float, float, Dict[str, float]]]:
     """
     回傳 (ai_prob, human_prob, max_confidence, breakdown)
-    - ai_prob: Fake 標籤分數
-    - human_prob: Real 標籤分數
+    - ai_prob: AI 生成機率
+    - human_prob: 人類撰寫機率
     - max_confidence: 最高分數，用於低信心提示
     - breakdown: 紀錄各模型輸出，便於除錯
     """
@@ -82,14 +85,12 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
     if not text:
         return None
 
-    # 輕量模型投票：OpenAI detector + ChatGPT detector
-    model_names = [
-        "roberta-base-openai-detector",  # Fake / Real
-        "Hello-SimpleAI/chatgpt-detector-roberta",  # ChatGPT / Human
-    ]
+    model_names = ["roberta-base-openai-detector"]  # Fake / Real
+    if use_ensemble:
+        model_names.append("Hello-SimpleAI/chatgpt-detector-roberta")  # ChatGPT / Human
 
-    ai_scores: List[Tuple[float, float]] = []  # (ai, weight)
-    human_scores: List[Tuple[float, float]] = []
+    ai_scores: List[float] = []
+    human_scores: List[float] = []
     breakdown: Dict[str, float] = {}
 
     for name in model_names:
@@ -116,13 +117,11 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
     if not ai_scores or not human_scores:
         return None
 
-    # 依各模型置信度 (|ai-human|) 加權平均，偏向高置信模型
+    # 依各模型置信度 (|ai-human|) 加權平均
     ai_prob = 0.0
     human_prob = 0.0
     weight_sum = 0.0
-    for ai, human in zip(ai_scores, human_scores):
-        ai_val = ai if isinstance(ai, float) else ai
-        human_val = human if isinstance(human, float) else human
+    for ai_val, human_val in zip(ai_scores, human_scores):
         weight = max(abs(ai_val - human_val), 0.1)
         ai_prob += ai_val * weight
         human_prob += human_val * weight
@@ -130,19 +129,20 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
     ai_prob = ai_prob / weight_sum
     human_prob = human_prob / weight_sum
 
-    # 針對明顯 LLM 片語做加權與下限提升（強制偏向 AI）
+    # 針對明顯 LLM 片語做強制偏向 AI
     heuristic = _heuristic_ai_boost(text)
     if heuristic > 0:
         ai_prob = 0.95
         human_prob = 0.05
     else:
-        # 使用 GPT2 困惑度作為輔助：低困惑度代表較像模型生成
-        ppl = _gpt2_perplexity(text)
-        if ppl is not None:
-            if ppl < 15:
-                ai_prob += 0.25
-            elif ppl < 30:
-                ai_prob += 0.15
+        # 使用困惑度作為輔助：低困惑度代表較像模型生成
+        if use_perplexity:
+            ppl = _gpt2_perplexity(text)
+            if ppl is not None:
+                if ppl < 15:
+                    ai_prob += 0.25
+                elif ppl < 30:
+                    ai_prob += 0.15
 
     # 正規化讓 AI% + Human% = 1
     total = ai_prob + human_prob
@@ -166,6 +166,18 @@ st.title("🧭 AI / Human 文章偵測器")
 st.write(
     "輸入一段文本或上傳文字檔，立即估計該段文字為 **AI 生成** 或 **人類撰寫** 的機率。"
 )
+
+# 側邊設定：避免 Streamlit Cloud 資源爆掉
+st.sidebar.header("設定 / 資源")
+light_mode = st.sidebar.checkbox("輕量模式（單模型、無困惑度）", value=True)
+if light_mode:
+    use_ensemble = False
+    use_perplexity = False
+else:
+    use_ensemble = st.sidebar.checkbox("啟用雙模型投票（較準確，較耗資源）", value=True)
+    use_perplexity = st.sidebar.checkbox("啟用困惑度輔助（較耗資源）", value=False)
+
+st.sidebar.info("若在雲端出現資源不足，請開啟「輕量模式」。")
 
 # 預設樣例
 sample_texts = {
@@ -224,7 +236,11 @@ if st.button("開始偵測"):
         st.warning("請先輸入文字或上傳檔案。")
     else:
         with st.spinner("模型推論中，請稍候..."):
-            result = predict(text)
+            result = predict(
+                text,
+                use_ensemble=use_ensemble,
+                use_perplexity=use_perplexity,
+            )
 
         if result is None:
             st.error("未取得有效輸入，請重試。")
@@ -257,3 +273,4 @@ st.markdown("---")
 st.caption(
     "隱私提示：所有推論僅在本地端執行，不會上傳或儲存您的文本。輸入過短時，模型信心可能較低。"
 )
+
