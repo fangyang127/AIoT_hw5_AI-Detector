@@ -1,9 +1,11 @@
 import io
+import math
 import re
 from typing import Dict, List, Optional, Tuple
 
 import streamlit as st
-from transformers import pipeline
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 
 # 支援多個模型並快取，方便 ensemble
@@ -14,6 +16,14 @@ def load_detector(model_name: str):
         model=model_name,
         device=-1,  # CPU
     )
+
+
+@st.cache_resource(show_spinner=False)
+def load_ppl_model():
+    """載入 GPT2 用於困惑度估計（小模型，CPU 可接受）。"""
+    tok = AutoTokenizer.from_pretrained("gpt2")
+    mdl = AutoModelForCausalLM.from_pretrained("gpt2")
+    return tok, mdl
 
 
 def read_uploaded_file(file) -> str:
@@ -39,9 +49,25 @@ def _heuristic_ai_boost(text: str) -> float:
         r"\bi am an artificial intelligence\b",
         r"\bi'm an ai\b",
         r"\bglad to help\b",
+        r"\bassistant\b",
+        r"\bas an assistant\b",
+        r"\bi cannot fulfill that request\b",
+        r"\bi don't have feelings\b",
     ]
     text_lower = text.lower()
     return 0.6 if any(re.search(p, text_lower) for p in patterns) else 0.0
+
+
+def _gpt2_perplexity(text: str) -> Optional[float]:
+    """計算 GPT2 困惑度，文本過短時返回 None。"""
+    if len(text.split()) < 8:
+        return None
+    tok, mdl = load_ppl_model()
+    enc = tok(text, return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        out = mdl(**enc, labels=enc["input_ids"])
+        loss = out.loss
+    return math.exp(loss.item())
 
 
 def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]:
@@ -56,7 +82,7 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
     if not text:
         return None
 
-    # 兩個輕量模型做投票：OpenAI detector + ChatGPT detector
+    # 輕量模型投票：OpenAI detector + ChatGPT detector
     model_names = [
         "roberta-base-openai-detector",  # Fake / Real
         "Hello-SimpleAI/chatgpt-detector-roberta",  # ChatGPT / Human
@@ -109,6 +135,14 @@ def predict(text: str) -> Optional[Tuple[float, float, float, Dict[str, float]]]
     if heuristic > 0:
         ai_prob = 0.95
         human_prob = 0.05
+    else:
+        # 使用 GPT2 困惑度作為輔助：低困惑度代表較像模型生成
+        ppl = _gpt2_perplexity(text)
+        if ppl is not None:
+            if ppl < 15:
+                ai_prob += 0.25
+            elif ppl < 30:
+                ai_prob += 0.15
 
     # 正規化讓 AI% + Human% = 1
     total = ai_prob + human_prob
